@@ -7,22 +7,71 @@ import logging
 from logging.handlers import RotatingFileHandler
 import argparse
 
-from github import Github, Repository
+from github import Github, Repository, Event
+import requests
 
 logger = logging.getLogger()
 
+class GitError(Exception):
+    msg: str
+
+    def __init__(self, msg: str):
+        super().__init__(msg)
+        self.msg = msg
+    
+    @classmethod
+    def from_error_msg(cls, stderr: bytes):
+        try:
+            fatal = next(
+                str for str in
+                stderr.decode('utf-8', 'replace').split('\n')
+                if str.startswith('fatal:')
+            )
+        except StopIteration:
+            return cls(stderr)
+        except UnicodeDecodeError:
+            return cls('unknown error')
+
+        if 'not a git repository' in fatal:
+            return NotRepositoryError(fatal)
+        if 'already exists and is not an empty' in fatal:
+            return RepositoryAlreadyExistsError(fatal)
+        if ('unable to access'                      in fatal or
+            'Could not read from remote repository' in fatal or
+            'unable to look up '                    in fatal):
+            return RepositoryUnavailableError(fatal)
+
+        return cls(stderr)
+
+class NotRepositoryError(GitError):
+    pass
+
+class RepositoryAlreadyExistsError(GitError):
+    pass
+
+class RepositoryUnavailableError(GitError):
+    pass
+
 class Git:
+    _env = {'LC_MESSAGES': 'en_US.UTF-8'}
+    
     @staticmethod
     def is_git_repo(dir: str) -> bool:
         return os.path.exists(os.path.join(dir, '.git'))
 
     @staticmethod
     def pull(repo_dir: str):
-        proc.run(['git', 'pull'], cwd=repo_dir, stdout=proc.PIPE, stderr=proc.PIPE)
-    
+        result = proc.run(['git', 'pull'], cwd=repo_dir, env=Git._env,
+                          stdout=proc.PIPE, stderr=proc.PIPE)
+        if result.returncode != 0:
+            raise GitError.from_error_msg(result.stderr)
+
     @staticmethod
     def clone(repo_dir: str, url: str):
-        proc.run(['git', 'clone', url, repo_dir], stdout=proc.PIPE, stderr=proc.PIPE)
+        result = proc.run(['git', 'clone', url, repo_dir], env=Git._env, 
+                          stdout=proc.PIPE, stderr=proc.PIPE)
+        if result.returncode != 0:
+            raise GitError.from_error_msg(result.stderr)
 
 class LocalRepository:
     gh: Github
@@ -40,15 +89,15 @@ class LocalRepository:
             if not Git.is_git_repo(self.path):
                 raise RuntimeError(f'repo dir {self.path} is not a git repository')
         else:
-            logger.info(f'cloning repository %s', self.repo.clone_url)
+            logger.info('cloning repository %s', self.repo.clone_url)
             Git.clone(self.path, self.repo.clone_url)
     
     def update(self):
         Git.pull(self.path)
-    
+
     def __eq__(self, value):
         return value.repo.id == self.repo.id
-    
+
     def __hash__(self):
         return self.repo.id
 
@@ -60,17 +109,36 @@ class GithubSync:
     def __init__(self, github):
         self.gh = github
         self.repos_dir = os.path.join(os.getcwd(), 'repos')
+        self.local_repos = set()
+
+    def init(self):
         if not os.path.exists(self.repos_dir):
             os.mkdir(self.repos_dir)
 
-        self._init_repos()
+        logger.info('initializing github syncer')
+        try:
+            self._init_repos()
+        except RepositoryUnavailableError as exc:
+            logger.warning('failed to initialize repositories at start - network is not available', exc_info=exc)
 
     def _init_repos(self):
         self.local_repos = set()
-
+        user = self.gh.get_user()
         for repo in self.gh.get_user().get_repos():
-            local_repo = LocalRepository(self.gh, repo, os.path.join(self.repos_dir, repo.name))
-            local_repo.init()
+            # Get only user's repos. i.e. skip orgs
+            if repo.owner != user:
+                continue
+            
+            repo_path = os.path.join(self.repos_dir, repo.name)
+            local_repo = LocalRepository(self.gh, repo, repo_path)
+            try:
+                local_repo.init()
+            except RepositoryAlreadyExistsError:
+                # This should not happen, because of checks
+                # but anyway not a fatal error
+                pass
+
+            self.local_repos.add(local_repo)
 
     def _find_new_repos(self):
         remote_repos = {
@@ -82,10 +150,12 @@ class GithubSync:
         deleted_repos = self.local_repos.difference(remote_repos)
 
         for repo in new_repos:
+            logger.info('adding repository %s to tracking')
             repo.init()
             self.local_repos.add(repo)
 
         for repo in deleted_repos:
+            logger.info('removing repository %s from tracking')
             self.local_repos.remove(repo)
 
     def sync(self):
@@ -93,51 +163,75 @@ class GithubSync:
         for repo in self.local_repos:
             repo.update()
 
+def is_git_installed():
+    out = proc.run(['git', '--version'])
+    return out.returncode == 0
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--token-file', type=str, required=True, help='File with GitHub token')
-    parser.add_argument('--update-delay', type=int, default=3600, help='Delay between git checks')
+    parser.add_argument('--update-delay', type=int, default=60, help='Delay between git checks')
     parser.add_argument('--log-file', type=str, help='File name of log file')
     parser.add_argument('--work-dir', type=str, help='Directory to store data in')
     args = parser.parse_args()
 
-    try:
-        with open(args.token_file, 'r') as token_file:
-            token = token_file.read().strip()
+    if args.token_file:
+        try:
+            with open(args.token_file, 'r') as token_file:
+                token = token_file.read().strip()
 
-    except IOError as io:
-        if io.errno == errno.ENOENT:
-            logger.error('provided token file does not exists')
-            sys.exit(1)
-        else:
-            logger.error('failed to read token file', exc_info=io)
+        except IOError as io:
+            if io.errno == errno.ENOENT:
+                logger.error('provided token file does not exists')
+                sys.exit(1)
+            else:
+                logger.error('failed to read token file', exc_info=io)
+                sys.exit(1)
+    else:
+        try:
+            token = os.environ['GHSYNCER_TOKEN']
+        except KeyError:
+            logger.error('token file is not specified and GHSYNCER_TOKEN env is not set')
             sys.exit(1)
 
     delay = args.update_delay
     if delay < 0:
         logger.error('invalid update delay value - can not be negative. given: %i', delay)
-        return
-    
+        sys.exit(1)
+
     handlers = None
     if args.log_file:
         handlers = [RotatingFileHandler(args.log_file, maxBytes=1024 * 1024, delay=True, backupCount=5)]
-    
+
     if args.work_dir:
         try:
             os.chdir(args.work_dir)
         except OSError as e:
             logger.error('failed to change directory to %s', args.work_dir, exc_info=e)
+            sys.exit(1)
+    
+    if not is_git_installed():
+        logger.error('could not detect git is installed on system')
+        sys.exit(1)
     
     logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s]: %(message)s', handlers=handlers)
 
-    logger.info('initializing github syncer')
     syncer = GithubSync(Github(token))
+    try:
+        syncer.init()
+    except Exception as e:
+        logger.error('failed to initialize repository', exc_info=e)
+        sys.exit(1)
+
     while True:
         try:
             syncer.sync()
-        except TimeoutError:
-            logger.warning('timeout exceeded during repos update')
-
+        except TimeoutError as exc:
+            logger.warning('timeout exceeded during repos update', exc_info=exc)
+        except requests.exceptions.ConnectionError as exc:
+            logger.warning('timeout exceeded for connection attempt', exc_info=exc)
+        except RepositoryUnavailableError as exc:
+            logger.warning('repository is unavailable', exc_info=exc)
         time.sleep(delay)
 
 if __name__ == "__main__":
