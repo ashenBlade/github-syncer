@@ -38,8 +38,9 @@ class GitError(Exception):
             return RepositoryAlreadyExistsError(fatal)
         if ('unable to access'                      in fatal or
             'Could not read from remote repository' in fatal or
-            'unable to look up '                    in fatal):
-            return RepositoryUnavailableError(fatal)
+            'unable to look up '                    in fatal or
+            'early EOF'                             in fatal):
+            return GitConnectionError(fatal)
 
         return cls(stderr)
 
@@ -49,7 +50,7 @@ class NotRepositoryError(GitError):
 class RepositoryAlreadyExistsError(GitError):
     pass
 
-class RepositoryUnavailableError(GitError):
+class GitConnectionError(GitError):
     pass
 
 class Git:
@@ -93,6 +94,7 @@ class LocalRepository:
             Git.clone(self.path, self.repo.clone_url)
     
     def update(self):
+        logger.debug('updating repository %s', self.repo.name)
         Git.pull(self.path)
 
     def __eq__(self, value):
@@ -118,15 +120,17 @@ class GithubSync:
         logger.info('initializing github syncer')
         try:
             self._init_repos()
-        except RepositoryUnavailableError as exc:
+        except GitConnectionError as exc:
+            logger.warning('failed to initialize repositories at start - network is not available', exc_info=exc)
+        except requests.ConnectionError as exc:
             logger.warning('failed to initialize repositories at start - network is not available', exc_info=exc)
 
     def _init_repos(self):
         self.local_repos = set()
         user = self.gh.get_user()
-        for repo in self.gh.get_user().get_repos():
+        for repo in user.get_repos():
             # Get only user's repos. i.e. skip orgs
-            if repo.owner != user:
+            if repo.owner.id != user.id:
                 continue
             
             repo_path = os.path.join(self.repos_dir, repo.name)
@@ -150,12 +154,12 @@ class GithubSync:
         deleted_repos = self.local_repos.difference(remote_repos)
 
         for repo in new_repos:
-            logger.info('adding repository %s to tracking')
+            logger.info('start tracking repository %s', repo.repo.name)
             repo.init()
             self.local_repos.add(repo)
 
         for repo in deleted_repos:
-            logger.info('removing repository %s from tracking')
+            logger.info('stop tracking repository %s', repo.repo.name)
             self.local_repos.remove(repo)
 
     def sync(self):
@@ -164,7 +168,7 @@ class GithubSync:
             repo.update()
 
 def is_git_installed():
-    out = proc.run(['git', '--version'])
+    out = proc.run(['git', '--version'], stdout=proc.PIPE, stderr=proc.PIPE)
     return out.returncode == 0
 
 def main():
@@ -223,16 +227,18 @@ def main():
         logger.error('failed to initialize repository', exc_info=e)
         sys.exit(1)
 
+    logger.info('synchronization is starting')
     while True:
+        time.sleep(delay)
+
         try:
             syncer.sync()
         except TimeoutError as exc:
             logger.warning('timeout exceeded during repos update', exc_info=exc)
         except requests.exceptions.ConnectionError as exc:
             logger.warning('timeout exceeded for connection attempt', exc_info=exc)
-        except RepositoryUnavailableError as exc:
+        except GitConnectionError as exc:
             logger.warning('repository is unavailable', exc_info=exc)
-        time.sleep(delay)
 
 if __name__ == "__main__":
     try:
