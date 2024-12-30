@@ -132,7 +132,7 @@ class GithubSync:
             # Get only user's repos. i.e. skip orgs
             if repo.owner.id != user.id:
                 continue
-            
+
             repo_path = os.path.join(self.repos_dir, repo.name)
             local_repo = LocalRepository(self.gh, repo, repo_path)
             try:
@@ -145,10 +145,12 @@ class GithubSync:
             self.local_repos.add(local_repo)
 
     def _find_new_repos(self):
+        user = self.gh.get_user()
         remote_repos = {
             LocalRepository(self.gh, repo, os.path.join(self.repos_dir, repo.name))
             for repo
-            in self.gh.get_user().get_repos()
+            in user.get_repos()
+            if repo.owner.id == user.id
         }
         new_repos = remote_repos.difference(self.local_repos)
         deleted_repos = self.local_repos.difference(remote_repos)
