@@ -73,6 +73,16 @@ class Git:
                           stdout=proc.PIPE, stderr=proc.PIPE)
         if result.returncode != 0:
             raise GitError.from_error_msg(result.stderr)
+        
+    @staticmethod
+    def has_any_branches(repo_dir: str):
+        result = proc.run(['git', 'branch'], cwd=repo_dir, env=Git._env, 
+                          stdout=proc.PIPE, stderr=proc.PIPE)
+        if result.returncode != 0:
+            raise GitError.from_error_msg(result.stderr)
+
+        return any(l for l in result.stdout.splitlines()
+                   if l.decode('utf-8', 'replace').strip())
 
 class LocalRepository:
     gh: Github
@@ -167,7 +177,16 @@ class GithubSync:
     def sync(self):
         self._find_new_repos()
         for repo in self.local_repos:
-            repo.update()
+            try:
+                repo.update()
+            except GitError as git_error:
+                if ('configuration specifies to merge with' in git_error.msg and 
+                    not Git.has_any_branches(repo.path)):
+                    # There may be empty repositories - they do not have any branches.
+                    # 'git pull' causes such error.
+                    pass
+                else:
+                    raise git_error
 
 def is_git_installed():
     out = proc.run(['git', '--version'], stdout=proc.PIPE, stderr=proc.PIPE)
@@ -178,7 +197,6 @@ def main():
     parser.add_argument('--token-file', type=str, required=True, help='File with GitHub token')
     parser.add_argument('--update-delay', type=int, default=60, help='Delay between git checks')
     parser.add_argument('--log-file', type=str, help='File name of log file')
-    parser.add_argument('--work-dir', type=str, help='Directory to store data in')
     args = parser.parse_args()
 
     if args.token_file:
@@ -208,13 +226,6 @@ def main():
     handlers = None
     if args.log_file:
         handlers = [RotatingFileHandler(args.log_file, maxBytes=1024 * 1024, delay=True, backupCount=5)]
-
-    if args.work_dir:
-        try:
-            os.chdir(args.work_dir)
-        except OSError as e:
-            logger.error('failed to change directory to %s', args.work_dir, exc_info=e)
-            sys.exit(1)
     
     if not is_git_installed():
         logger.error('could not detect git is installed on system')
